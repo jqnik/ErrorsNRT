@@ -7,8 +7,7 @@ import org.apache.spark.streaming.Duration
 import org.apache.spark.streaming.Seconds
 import org.apache.spark.sql._
 import org.apache.spark.streaming.flume._
-import org.apache.spark.SparkConf
-import org.apache.spark.SparkContext
+import org.apache.spark.{rdd, SparkConf, SparkContext}
 import org.apache.log4j._
 import java.io._
 
@@ -21,6 +20,7 @@ case class Config(
   cp: String = "",
   flumeHost: String = "localhost",
   flumePort: Int = 7777,
+  numStreams: Int = 1,
   batchSeconds: Int = 15,
   slideSeconds: Int = 300,
   windowSeconds: Int = 300,
@@ -97,6 +97,10 @@ object ErrorsNRT {
       c.copy(flumePort = x)
     } text ("defines the port running the flume spark sink that the receiver will connect to. Defaults to 7777\n")
 
+    opt[Int]('s', "numStreams") valueName ("<num-streams>") action { (x, c) =>
+      c.copy(numStreams = x)
+    } text ("defines the number of Dstreams used to process events (for scalbility and high availability) uses additional ports by adding to flumePort for each additional stream\n")
+
     opt[Boolean]('v', "verbose") valueName ("<verbose>") action { (x, c) =>
       c.copy(verbose = x)
     } text ("Verbosity\n")
@@ -134,6 +138,7 @@ object ErrorsNRT {
       log.info(">>> config.slideSeconds     : " + config.slideSeconds)
       log.info(">>> config.windowSeconds    : " + config.windowSeconds)
       log.info(">>> config.verbose          : " + config.verbose)
+      log.info(">>> config.numStreams       : " + config.numStreams)
 
       myConfig = config
 
@@ -146,7 +151,6 @@ object ErrorsNRT {
     def usage(): Unit = {
       println("Usage: --help shows you the full parameter list.")
     }
-
 
     val microBatchSeconds = myConfig.batchSeconds
     val windowSeconds = myConfig.windowSeconds
@@ -169,12 +173,16 @@ object ErrorsNRT {
     sscConf.set("spark.streaming.blockInterval", "100")
     val ssc = new StreamingContext(sc, Seconds(myConfig.batchSeconds))
     ssc.checkpoint(cpfile.getAbsolutePath)
-    // Create a DStream using data received after connecting to port 7777 on the local machine
-    val flumeStream = FlumeUtils.createPollingStream(ssc, myConfig.flumeHost, myConfig.flumePort)
+
+    val flumeStreams = (0 to (myConfig.numStreams - 1)).map {
+      i => FlumeUtils.createPollingStream(ssc, "test552-master.fq.dn", myConfig.flumePort + i)
+    }
+
+    val unifiedFlumeStream = ssc.union(flumeStreams)
 
     // These are the key/value (error-code/log-body) pairs as we want to deal with them, derived from the flume event stream
     if(myConfig.out.length >= 1) {
-      val microBatch = flumeStream.map(e => (new String(new Interrogator().getStatusCode(
+      val microBatch = unifiedFlumeStream.map(e => (new String(new Interrogator().getStatusCode(
         new String(e.event.getBody.array()))).toInt,
         new String(e.event.getBody.array())))
       val reportedBatch = microBatch.window(Seconds(windowSeconds), Seconds(slideSeconds))
@@ -183,8 +191,9 @@ object ErrorsNRT {
 
     // These are the aggregates (error-code/count) that we want to report
     // map the events into key/value pairs -> (errorcode, 1)
-    val microAgg = flumeStream.map(e => (new String(new Interrogator()
-      .getStatusCode( new String(e.event.getBody.array()))).toInt, 1))
+    val microAgg = unifiedFlumeStream.map(e => (new String(new Interrogator()
+      .getStatusCode(new String(e.event.getBody.array()))).toInt, 1)
+    )
 
     // reduces all events that occured within the given window of time
     // and produces a new DStream on that time window
@@ -194,13 +203,18 @@ object ErrorsNRT {
       {(a,b) => a + b},
       {(a,b) => a - b},
       Seconds(windowSeconds),
-      Seconds(slideSeconds))
+      Seconds(slideSeconds)
+    )
 
     val sqlContext = new org.apache.spark.sql.SQLContext(sc)
     import sqlContext.implicits._
     sqlContext.setConf("spark.sql.parquet.binaryAsString", "true")
     reportedAgg.foreachRDD((rdd, time) => {
-      val rowsDF = rdd.map(x => HTTPEvent(x._1.toString, x._2.toString, time.toString().stripSuffix(" ms"))).toDF()
+      println("foreachRDD")
+      val rowsDF = rdd.
+        filter(x=> x._2 > 0).
+        map(x => HTTPEvent(x._1.toString, x._2.toString, time.toString().stripSuffix(" ms"))).
+        toDF()
       rowsDF.write.mode(org.apache.spark.sql.SaveMode.Append).save(myConfig.agg)
     })
 
